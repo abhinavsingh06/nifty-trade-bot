@@ -1,0 +1,18 @@
+YOUR_DOMAIN.com {
+	encode gzip
+
+	# Simple protection for a trading dashboard exposed to the internet.
+	# Generate a hash with: `caddy hash-password --plaintext 'yourpassword'`
+	basicauth /* {
+		admin $2a$14$REPLACE_WITH_CADDY_BCRYPT_HASH
+	}
+
+	# Bot dashboard (HTTP inside Docker network)
+	reverse_proxy nifty-bot:3020
+
+	# If you enable n8n in docker-compose.prod.yml, uncomment this:
+	# handle_path /n8n/* {
+	# 	reverse_proxy n8n:5678
+	# }
+}
+

@@ -1,0 +1,8 @@
+node_modules
+.git
+.env
+runtime
+dashboard-dist
+*.md
+.DS_Store
+.cursor

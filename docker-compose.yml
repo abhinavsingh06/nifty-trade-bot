@@ -1,0 +1,20 @@
+# Oracle Cloud / any VPS: `docker compose up -d`
+# Copy `.env.example` → `.env` on the server and fill secrets. Open TCP 3020 in the cloud NSG/firewall (or put Caddy/nginx in front).
+
+services:
+  nifty-bot:
+    build: .
+    image: nifty-bot:latest
+    restart: unless-stopped
+    ports:
+      - "3020:3020"
+    env_file:
+      - .env
+    environment:
+      DASHBOARD_HOST: "0.0.0.0"
+      DASHBOARD_PORT: "3020"
+    volumes:
+      - nifty-runtime:/app/runtime
+
+volumes:
+  nifty-runtime:

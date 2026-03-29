@@ -1,0 +1,61 @@
+# Production-ish compose: bot + Caddy HTTPS + optional n8n.
+#
+# Usage:
+# - Copy `.env.example` -> `.env` and fill secrets on the server.
+# - Edit `Caddyfile` with your domain and basicauth hash.
+# - `docker compose -f docker-compose.prod.yml up -d --build`
+#
+# Notes:
+# - Persists `runtime/` in a named volume.
+# - Caddy stores certs in `caddy_data`.
+# - n8n is included but disabled by default (remove `profiles: [\"optional\"]` to enable).
+
+services:
+  nifty-bot:
+    build: .
+    image: nifty-bot:latest
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DASHBOARD_HOST: "0.0.0.0"
+      DASHBOARD_PORT: "3020"
+    volumes:
+      - nifty-runtime:/app/runtime
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - nifty-bot
+
+  n8n:
+    image: n8nio/n8n:latest
+    restart: unless-stopped
+    profiles: ["optional"]
+    environment:
+      N8N_PORT: "5678"
+      N8N_PROTOCOL: "https"
+      # Change this to your domain when enabling n8n behind Caddy:
+      N8N_HOST: "YOUR_DOMAIN.com"
+      WEBHOOK_URL: "https://YOUR_DOMAIN.com/n8n"
+      N8N_BASIC_AUTH_ACTIVE: "true"
+      N8N_BASIC_AUTH_USER: "admin"
+      N8N_BASIC_AUTH_PASSWORD: "change-me"
+      GENERIC_TIMEZONE: "Asia/Kolkata"
+    volumes:
+      - n8n_data:/home/node/.n8n
+
+volumes:
+  nifty-runtime:
+  caddy_data:
+  caddy_config:
+  n8n_data:
+
