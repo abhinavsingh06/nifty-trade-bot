@@ -63,9 +63,17 @@ export function loadOptionInstruments(config) {
   );
 }
 
-export function selectOptionContract(config, instruments, signal, spotPrice, timestamp) {
+/**
+ * @param {object} [strikeOptions]
+ * @param {number} [strikeOptions.strikeOffsetSteps] 0 = ATM, 1 = one strike step OTM (higher CE / lower PE)
+ */
+export function selectOptionContract(config, instruments, signal, spotPrice, timestamp, strikeOptions = {}) {
   const targetType = signal.direction === "CALL" ? "CE" : "PE";
-  const targetStrike = roundToStep(spotPrice, config.optionSelection.strikeStep);
+  const step = config.optionSelection.strikeStep;
+  const atm = roundToStep(spotPrice, step);
+  const offsetSteps = Math.max(0, Number(strikeOptions.strikeOffsetSteps ?? 0));
+  const targetStrike =
+    signal.direction === "CALL" ? atm + step * offsetSteps : atm - step * offsetSteps;
   const signalTime = new Date(timestamp);
 
   const eligible = instruments

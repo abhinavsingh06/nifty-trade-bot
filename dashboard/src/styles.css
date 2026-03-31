@@ -36,4 +36,11 @@
     font-size: 0.9rem;
     line-height: 1.45;
   }
+
+  .terminal-compact {
+    min-height: 0;
+    padding: 12px;
+    border-radius: 0;
+    font-size: 0.75rem;
+  }
 }

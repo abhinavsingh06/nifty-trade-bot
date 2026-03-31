@@ -167,6 +167,16 @@ export async function fetchOrderHistory(config, orderId) {
   return body.data ?? [];
 }
 
+/** Today's executed trades (fills), for reconciliation vs local positions. */
+export async function fetchTrades(config) {
+  const response = await fetch(`${config.zerodha.baseUrl}/trades`, {
+    headers: buildHeaders(config)
+  });
+
+  const body = await parseResponse(response);
+  return body.data ?? [];
+}
+
 export async function fetchPositions(config) {
   const response = await fetch(`${config.zerodha.baseUrl}/portfolio/positions`, {
     headers: buildHeaders(config)

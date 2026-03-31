@@ -30,6 +30,13 @@ export function getPaperWallet(config) {
   return wallet;
 }
 
+/** Clears ledger and cash to current `PAPER_INITIAL_CAPITAL` (and wipes txn history). */
+export function resetPaperWalletToConfig(config) {
+  const next = defaultWallet(config);
+  saveWallet(config, next);
+  return next;
+}
+
 export function debitPaperEntry(config, position, optionPrice) {
   const wallet = getPaperWallet(config);
   const entryPrice = Number(optionPrice ?? position.entryOptionPrice ?? 0);
@@ -60,6 +67,35 @@ export function debitPaperEntry(config, position, optionPrice) {
     tradeCost,
     entryPrice
   };
+}
+
+export function creditPaperPartialExit(config, position, qtyClosed, exitPrice) {
+  const wallet = getPaperWallet(config);
+  const exit = Number(exitPrice ?? 0);
+  const entryPrice = Number(position.entryOptionPrice ?? 0);
+  const q = Number(qtyClosed ?? 0);
+  if (!(exit > 0) || !(q > 0)) {
+    throw new Error("Partial exit needs positive exit price and quantity.");
+  }
+  const credit = Number((exit * q).toFixed(2));
+  const realizedPnL = Number(((exit - entryPrice) * q).toFixed(2));
+
+  wallet.cashBalance = Number((wallet.cashBalance + credit).toFixed(2));
+  wallet.realizedPnL = Number((wallet.realizedPnL + realizedPnL).toFixed(2));
+  wallet.transactions.push({
+    id: `paper-partial-${position.id}-${Date.now()}`,
+    type: "PARTIAL_SELL",
+    timestamp: new Date().toISOString(),
+    positionId: position.id,
+    option: position.option?.tradingsymbol ?? position.symbol,
+    quantity: q,
+    optionPrice: exit,
+    amount: credit,
+    realizedPnL,
+    cashBalanceAfter: wallet.cashBalance
+  });
+  saveWallet(config, wallet);
+  return { wallet, exitPrice: exit, realizedPnL, credit };
 }
 
 export function creditPaperExit(config, closedPosition, optionPrice) {

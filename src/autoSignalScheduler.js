@@ -1,10 +1,13 @@
 import { getEnv } from "./config.js";
 import { generateSignalRun } from "./executor.js";
-import { fetchQuote } from "./kiteApi.js";
+import { fetchQuote, isSessionExpiredError } from "./kiteApi.js";
 import { loadRuntimeCandles } from "./marketData.js";
 import { notifyTradeableSignal } from "./notify.js";
 import { persistRunArtifact } from "./reporters.js";
-import { ensureDir, isMarketOpen, writeJson } from "./utils.js";
+import { isTradeSessionOpen } from "./marketCalendar.js";
+import { ensureDir, writeJson } from "./utils.js";
+import { buildPaperEntryGuard } from "./tradingDeskPolicy.js";
+import { listClosedPositions, listOpenPositions } from "./positionManager.js";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -50,11 +53,24 @@ export async function runAutoSignalPass(config, options = {}) {
   const { skipMarketHoursCheck = false, reason = "scheduled" } = options;
   const nowIso = new Date().toISOString();
 
-  if (!skipMarketHoursCheck && !isMarketOpen(nowIso, config)) {
+  if (!skipMarketHoursCheck && !isTradeSessionOpen(nowIso, config)) {
     return { ran: false, skipped: "outside_market_hours" };
   }
 
-  const candleResult = await loadRuntimeCandles(config, { allowSampleFallback: false });
+  let candleResult;
+  try {
+    candleResult = await loadRuntimeCandles(config, { allowSampleFallback: false });
+  } catch (error) {
+    const sessionExpired = isSessionExpiredError(error);
+    const state = loadSchedulerState(config);
+    state.lastError = {
+      at: nowIso,
+      message: error.message,
+      type: sessionExpired ? "session_expired" : "candle_fetch"
+    };
+    saveSchedulerState(config, state);
+    return { ran: false, error: error.message, sessionExpired };
+  }
 
   if (candleResult.skipped || !candleResult.candles?.length) {
     return {
@@ -85,6 +101,16 @@ export async function runAutoSignalPass(config, options = {}) {
     state.history = [...(state.history ?? []), entry];
     saveSchedulerState(config, state);
 
+    const positions = {
+      open: listOpenPositions(config),
+      closed: listClosedPositions(config)
+    };
+    const deskGuard = buildPaperEntryGuard(config, positions);
+    if (deskGuard.blocked) {
+      console.warn(`[auto-signals] notify skipped (desk): ${deskGuard.reasons.join(" ")}`);
+      return { ran: true, entry, notifySkipped: deskGuard.reasons };
+    }
+
     await notifyTradeableSignal(config, result.signal);
 
     return { ran: true, entry };
@@ -103,13 +129,13 @@ function shouldRunByInterval(state, intervalMs, now) {
  */
 export function startAutoSignalScheduler({ config, onAfterRun }) {
   const intervalMs = getIntervalMs();
-  let lastMarketOpen = isMarketOpen(new Date().toISOString(), config);
+  let lastMarketOpen = isTradeSessionOpen(new Date().toISOString(), config);
   let timer = null;
 
   const tick = async () => {
     const nowDate = new Date();
     const nowIso = nowDate.toISOString();
-    const open = isMarketOpen(nowIso, config);
+    const open = isTradeSessionOpen(nowIso, config);
     const justOpened = open && !lastMarketOpen;
     lastMarketOpen = open;
 
@@ -163,6 +189,8 @@ export function startAutoSignalScheduler({ config, onAfterRun }) {
       console.log(
         `[auto-signals] ${outcome.entry.at} ${outcome.entry.direction} score=${outcome.entry.score} spot=${outcome.entry.spot}`
       );
+    } else if (outcome.sessionExpired) {
+      console.warn(`[auto-signals] SESSION EXPIRED — re-login required. ${outcome.error}`);
     } else if (outcome.error) {
       console.warn(`[auto-signals] error: ${outcome.error}`);
     } else if (outcome.skipped === "no_live_candles") {

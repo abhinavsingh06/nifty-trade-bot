@@ -1,6 +1,11 @@
 import { clamp } from "./utils.js";
 import {
+  calculateATR,
+  calculateBollingerBands,
+  calculateMACD,
+  calculateRSI,
   calculateSimpleMovingAverage,
+  calculateSupertrend,
   calculateVWAP,
   detectRange,
   getLatestCandle
@@ -162,6 +167,12 @@ export function analyzeSignal(candles, config) {
     }
   };
 
+  const rsiResult = calculateRSI(candles, 14, 20);
+  const macdResult = calculateMACD(candles, 12, 26, 9);
+  const bbResult = calculateBollingerBands(candles, 20, 2);
+  const atrResult = calculateATR(candles, 14);
+  const supertrendResult = calculateSupertrend(candles, 7, 3);
+
   return {
     symbol: config.niftySymbol,
     direction,
@@ -188,6 +199,13 @@ export function analyzeSignal(candles, config) {
       recentLow: round(recentRange.low),
       candleBody: round(candleBody),
       averageRecentMove: round(averageRecentMove)
+    },
+    technicals: {
+      rsi: rsiResult,
+      macd: macdResult,
+      bollingerBands: bbResult,
+      atr: atrResult,
+      supertrend: supertrendResult
     }
   };
 }

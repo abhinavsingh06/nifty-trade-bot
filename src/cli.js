@@ -1,6 +1,13 @@
+import fs from "node:fs";
 import { getConfig, getEnv } from "./config.js";
 import { runBacktest } from "./backtestEngine.js";
-import { exchangeRequestToken, getLoginUrl, isSessionExpiredError, refreshInstruments } from "./kiteApi.js";
+import {
+  exchangeRequestToken,
+  fetchQuote,
+  getLoginUrl,
+  isSessionExpiredError,
+  refreshInstruments
+} from "./kiteApi.js";
 import { loadBacktestCandles, loadRuntimeCandles } from "./marketData.js";
 import {
   checkSessionRun,
@@ -60,6 +67,12 @@ function printMonitorResult(result) {
     if (item.exitReason) {
       console.log(`  Exit reason: ${item.exitReason}`);
     }
+    if (item.warning) {
+      console.log(`  Warning: ${item.warning}`);
+    }
+    if (item.optionFillPrice != null) {
+      console.log(`  Exit fill (premium): ${item.optionFillPrice}`);
+    }
     if (item.position?.activeStopLoss) {
       console.log(`  Active stop: ${item.position.activeStopLoss}`);
     }
@@ -83,18 +96,32 @@ function printReconcileResult(result) {
   console.log(`Local open: ${result.totals.localOpen}`);
   console.log(`Local closed: ${result.totals.localClosed}`);
   console.log(`Broker orders today: ${result.totals.brokerOrdersToday}`);
+  console.log(`Broker trades today: ${result.totals.brokerTradesToday ?? 0}`);
   console.log(`Broker net positions: ${result.totals.brokerNetPositions}`);
-  if (!result.openPositions.length) {
+  if (result.openPositions?.length) {
+    for (const position of result.openPositions) {
+      console.log(`- ${position.localId}`);
+      console.log(`  Option: ${position.localOption}`);
+      console.log(`  Broker order: ${position.brokerOrderId ?? "n/a"} (${position.brokerOrderStatus})`);
+      console.log(`  Filled qty: ${position.brokerFilledQuantity}`);
+      console.log(`  Broker net qty: ${position.brokerNetQuantity}`);
+      if (position.todayTrades?.legCount) {
+        console.log(
+          `  Today's fills: buy ${position.todayTrades.buyQuantity} (vwap ${position.todayTrades.vwapBuy}) | sell ${position.todayTrades.sellQuantity} (vwap ${position.todayTrades.vwapSell}) | net ${position.todayTrades.netQuantity}`
+        );
+      }
+    }
+  } else {
     console.log("No local open positions to reconcile.");
-    return;
   }
 
-  for (const position of result.openPositions) {
-    console.log(`- ${position.localId}`);
-    console.log(`  Option: ${position.localOption}`);
-    console.log(`  Broker order: ${position.brokerOrderId ?? "n/a"} (${position.brokerOrderStatus})`);
-    console.log(`  Filled qty: ${position.brokerFilledQuantity}`);
-    console.log(`  Broker net qty: ${position.brokerNetQuantity}`);
+  if (result.closedFillHints?.length) {
+    console.log("Recent local exits vs broker fills (order id):");
+    for (const row of result.closedFillHints) {
+      console.log(
+        `  ${row.localId} ${row.option ?? ""}: exit legs ${row.exitTradeLegs}${row.brokerPremiumPnLFromExitFills != null ? ` broker opt PnL ~ ${row.brokerPremiumPnLFromExitFills}` : ""}`
+      );
+    }
   }
 }
 
@@ -142,7 +169,16 @@ async function main() {
   }
 
   const allowSampleFallback = ["smoke", "backtest"].includes(command) || process.env.BOT_ALLOW_SAMPLE_FALLBACK === "1";
-  const candleResult = ["login-url", "session-exchange", "instruments-refresh", "monitor", "reconcile", "check-session", "review-forward"].includes(command)
+  const candleResult = [
+    "login-url",
+    "session-exchange",
+    "instruments-refresh",
+    "monitor",
+    "reconcile",
+    "check-session",
+    "review-forward",
+    "smoke-connect"
+  ].includes(command)
     ? { candles: [], source: "none", skipped: false, reason: "" }
     : await loadRuntimeCandles(config, { allowSampleFallback });
 
@@ -179,6 +215,52 @@ async function main() {
     const result = await checkSessionRun(config);
     printSessionResult(result);
     console.log(`Saved: ${persistRunArtifact(config, command, result)}`);
+    return;
+  }
+
+  if (command === "smoke-connect") {
+    let session;
+    try {
+      session = await checkSessionRun(config);
+    } catch (error) {
+      session = {
+        status: "SESSION_ERROR",
+        checkedAt: new Date().toISOString(),
+        error: error.message ?? String(error)
+      };
+    }
+
+    const key = `${config.niftyIndex.exchange}:${config.niftyIndex.tradingsymbol}`;
+    let indexQuote = null;
+    try {
+      const map = await fetchQuote(config, [key]);
+      indexQuote = map[key] ?? null;
+    } catch (error) {
+      indexQuote = { error: error.message ?? String(error) };
+    }
+
+    let instrumentsBytes = 0;
+    let instrumentsOk = false;
+    try {
+      const st = fs.statSync(config.instrumentsCachePath);
+      instrumentsBytes = st.size;
+      instrumentsOk = instrumentsBytes > 2000;
+    } catch {
+      instrumentsOk = false;
+    }
+
+    const summary = {
+      sessionStatus: session.status,
+      indexQuoteOk: Boolean(indexQuote && !indexQuote.error && indexQuote.last_price),
+      instrumentsOk,
+      instrumentsBytes,
+      instrumentsCachePath: config.instrumentsCachePath
+    };
+    console.log(JSON.stringify({ summary, session, indexQuote }, null, 2));
+
+    if (session.status !== "SESSION_OK" || !summary.indexQuoteOk || !instrumentsOk) {
+      process.exitCode = 1;
+    }
     return;
   }
 

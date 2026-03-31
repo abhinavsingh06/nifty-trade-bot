@@ -11,6 +11,20 @@ export function escapeText(value: unknown) {
   return value == null ? "-" : String(value);
 }
 
+/** Format a number as Indian Rupees (premiums, balances, P&amp;L). Not for index/spot levels. */
+export function inr(value: unknown, decimals = 2): string {
+  if (value == null || value === "") return "—";
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "—";
+  const abs = Math.abs(n);
+  const formatted = abs.toLocaleString("en-IN", {
+    minimumFractionDigits: decimals,
+    maximumFractionDigits: decimals
+  });
+  if (n < 0) return `-₹${formatted}`;
+  return `₹${formatted}`;
+}
+
 export function sentimentClasses(sentiment?: string) {
   if (sentiment === "bullish") return "bg-emerald-50 text-emerald-700";
   if (sentiment === "bearish") return "bg-rose-50 text-rose-700";

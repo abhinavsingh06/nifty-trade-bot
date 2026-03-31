@@ -41,6 +41,7 @@ export function createPositionRecord(config, signal, riskCheck, brokerResponse) 
     id: `${signal.option?.tradingsymbol ?? signal.symbol}-${Date.now()}`,
     status: "OPEN",
     createdAt: new Date().toISOString(),
+    paperSetupId: signal.paperSetupId ?? null,
     symbol: signal.symbol,
     direction: signal.direction,
     option: signal.option,
@@ -117,7 +118,13 @@ export function closePositionRecord(config, positionId, exitInfo) {
   return closed;
 }
 
-export function evaluateExit(position, spotPrice, optionPrice = null) {
+/**
+ * @param {object} [config] trading config (trail distances); omit for tests / legacy
+ */
+export function evaluateExit(position, spotPrice, optionPrice = null, config = {}) {
+  const trailUnderlying = Number(config.trailingStopUnderlyingPoints ?? 0);
+  const trailOption = Number(config.trailingStopOptionPoints ?? 0);
+
   const updated = {
     ...position,
     lastObservedSpot: spotPrice,
@@ -138,6 +145,33 @@ export function evaluateExit(position, spotPrice, optionPrice = null) {
         updated.activeOptionStopLoss = updated.entryOptionPrice;
       }
     }
+  }
+
+  if (updated.target1Hit && Number.isFinite(trailUnderlying) && trailUnderlying > 0) {
+    if (updated.direction === "CALL") {
+      const peak = Math.max(updated.trailingPeakUnderlying ?? updated.entryUnderlying, spotPrice);
+      updated.trailingPeakUnderlying = peak;
+      const trailStop = peak - trailUnderlying;
+      updated.activeStopLoss = Math.max(updated.activeStopLoss, trailStop);
+    } else {
+      const trough = Math.min(updated.trailingTroughUnderlying ?? updated.entryUnderlying, spotPrice);
+      updated.trailingTroughUnderlying = trough;
+      const trailStop = trough + trailUnderlying;
+      updated.activeStopLoss = Math.min(updated.activeStopLoss, trailStop);
+    }
+  }
+
+  if (
+    updated.target1Hit &&
+    Number.isFinite(trailOption) &&
+    trailOption > 0 &&
+    optionPrice != null &&
+    updated.entryOptionPrice != null
+  ) {
+    const peakOpt = Math.max(updated.trailingPeakOption ?? updated.entryOptionPrice, optionPrice);
+    updated.trailingPeakOption = peakOpt;
+    const trailOptStop = Math.max(peakOpt - trailOption, 0.05);
+    updated.activeOptionStopLoss = Math.max(updated.activeOptionStopLoss ?? 0, trailOptStop);
   }
 
   const target2HitUnderlying =

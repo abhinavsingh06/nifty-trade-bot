@@ -1,5 +1,6 @@
 import path from "node:path";
-import { isMarketOpen, readJson, writeJson } from "./utils.js";
+import { isTradeSessionOpen } from "./marketCalendar.js";
+import { readJson, writeJson } from "./utils.js";
 
 function getDateKey(timestamp, timezone) {
   return new Intl.DateTimeFormat("en-CA", {
@@ -58,8 +59,8 @@ export function buildRiskCheck(config, signal) {
     },
     {
       name: "market session",
-      pass: isMarketOpen(signal.timestamp, config),
-      detail: `${signal.timestamp} in ${config.marketTimezone}`
+      pass: isTradeSessionOpen(signal.timestamp, config),
+      detail: `${signal.timestamp} in ${config.marketTimezone}${config.marketSessionStrict ? " (holiday-aware)" : ""}`
     },
     {
       name: "option contract resolved",
@@ -103,11 +104,24 @@ export function recordTradeExit(config, closedPosition) {
   const timestamp = closedPosition.closedAt ?? new Date().toISOString();
   const tradeState = getTradeState(config, timestamp);
   const dayState = tradeState.state[tradeState.dateKey];
-  const entry = Number(closedPosition.entryUnderlying ?? 0);
-  const exit = Number(closedPosition.exit?.spotPrice ?? entry);
-  const signedPoints =
-    closedPosition.direction === "CALL" ? exit - entry : entry - exit;
-  const realizedPnL = Number((signedPoints * Number(closedPosition.quantity ?? 0)).toFixed(2));
+  const qty = Number(closedPosition.quantity ?? 0);
+  const exitOpt =
+    closedPosition.exit?.optionFillPrice ?? closedPosition.exit?.optionPrice ?? null;
+  const entryOpt =
+    closedPosition.entryOptionPrice != null ? Number(closedPosition.entryOptionPrice) : null;
+
+  let realizedPnL;
+  let pnlBasis = "UNDERLYING_PROXY";
+  if (entryOpt != null && exitOpt != null && qty > 0) {
+    realizedPnL = Number(((Number(exitOpt) - entryOpt) * qty).toFixed(2));
+    pnlBasis = "OPTION_PREMIUM";
+  } else {
+    const entry = Number(closedPosition.entryUnderlying ?? 0);
+    const exit = Number(closedPosition.exit?.spotPrice ?? entry);
+    const signedPoints =
+      closedPosition.direction === "CALL" ? exit - entry : entry - exit;
+    realizedPnL = Number((signedPoints * qty).toFixed(2));
+  }
 
   dayState.realizedPnL = Number((dayState.realizedPnL + realizedPnL).toFixed(2));
   dayState.history.push({
@@ -116,9 +130,36 @@ export function recordTradeExit(config, closedPosition) {
     direction: closedPosition.direction,
     option: closedPosition.option?.tradingsymbol ?? closedPosition.symbol,
     realizedPnL,
+    pnlBasis,
     exitReason: closedPosition.exit?.reason ?? "UNKNOWN"
   });
   writeJson(tradeState.filePath, tradeState.state);
 
+  return realizedPnL;
+}
+
+/** Add partial realized PnL to the same daily trade-state bucket as full exits. */
+export function recordPaperPartialRealized(config, { positionId, quantityClosed, entryPrice, exitPrice, timestamp }) {
+  const ts = timestamp ?? new Date().toISOString();
+  const tradeState = getTradeState(config, ts);
+  const dayState = tradeState.state[tradeState.dateKey];
+  const qty = Number(quantityClosed ?? 0);
+  const en = Number(entryPrice ?? 0);
+  const ex = Number(exitPrice ?? 0);
+  if (!(qty > 0) || !Number.isFinite(en) || !Number.isFinite(ex)) {
+    return null;
+  }
+  const realizedPnL = Number(((ex - en) * qty).toFixed(2));
+  dayState.realizedPnL = Number((dayState.realizedPnL + realizedPnL).toFixed(2));
+  dayState.history.push({
+    positionId,
+    closedAt: ts,
+    partial: true,
+    quantityClosed: qty,
+    realizedPnL,
+    pnlBasis: "OPTION_PREMIUM",
+    exitReason: "PARTIAL_PAPER_EXIT"
+  });
+  writeJson(tradeState.filePath, tradeState.state);
   return realizedPnL;
 }

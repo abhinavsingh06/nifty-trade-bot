@@ -49,11 +49,21 @@ export type SignalPayload = {
     candleBody?: number;
     averageRecentMove?: number;
   };
+  technicals?: TechnicalsPayload | null;
 };
 
 export type PositionRecord = {
   id?: string;
-  option?: { tradingsymbol?: string };
+  paperSetupId?: string | null;
+  createdAt?: string;
+  closedAt?: string;
+  option?: {
+    tradingsymbol?: string;
+    exchange?: string;
+    strike?: number | string;
+    instrument_type?: string;
+    expiry?: string;
+  };
   symbol?: string;
   quantity?: number;
   lots?: number;
@@ -66,8 +76,19 @@ export type PositionRecord = {
   target2?: number;
   optionTarget1?: number | null;
   optionTarget2?: number | null;
+  lastObservedSpot?: number | null;
   lastObservedOptionPrice?: number | null;
-  exit?: { reason?: string; spotPrice?: number; brokerMode?: string };
+  /** ISO time when this row was last included in a successful quote batch */
+  lastQuoteAt?: string | null;
+  exit?: {
+    reason?: string;
+    spotPrice?: number;
+    optionPrice?: number;
+    optionFillPrice?: number;
+    brokerMode?: string;
+    brokerOrderId?: string | null;
+    fillStatus?: string;
+  };
   brokerMode?: string;
 };
 
@@ -77,6 +98,42 @@ export type ArtifactStatus = {
   command?: string;
   timestamp?: string;
   signal?: SignalPayload;
+};
+
+export type PaperAnalyticsTradeRow = {
+  id?: string;
+  option?: string;
+  direction?: string;
+  closedAt?: string;
+  setupId?: string | null;
+  entryPremium?: number;
+  exitPremium?: number;
+  quantity?: number;
+  pnl?: number | null;
+  outcome?: string;
+  exitReason?: string | null;
+};
+
+export type PaperSetupBreakdownRow = {
+  setupId?: string;
+  count?: number;
+  wins?: number;
+  losses?: number;
+  breakeven?: number;
+  totalPnl?: number;
+  winRatePct?: number | null;
+};
+
+export type PaperAnalyticsSummary = {
+  closedCount?: number;
+  withPnlCount?: number;
+  wins?: number;
+  losses?: number;
+  breakeven?: number;
+  winRatePct?: number | null;
+  totalRealizedPnl?: number;
+  trades?: PaperAnalyticsTradeRow[];
+  bySetupRows?: PaperSetupBreakdownRow[];
 };
 
 export type NoticeTone = "success" | "warning" | "error" | "info";
@@ -154,17 +211,154 @@ export type CryptoDashboardState = {
   };
 };
 
+export type TechnicalsPayload = {
+  rsi?: {
+    value?: number | null;
+    history?: number[];
+  } | null;
+  macd?: {
+    macd?: number | null;
+    signal?: number | null;
+    histogram?: number | null;
+    history?: Array<{ macd: number; signal: number; histogram: number }>;
+  } | null;
+  bollingerBands?: {
+    upper?: number;
+    middle?: number;
+    lower?: number;
+    position?: number;
+    zone?: string;
+    bandLabel?: string;
+  } | null;
+  atr?: {
+    value?: number | null;
+    history?: number[];
+  } | null;
+  supertrend?: {
+    value?: number | null;
+    trend?: "up" | "down" | null;
+    upperBand?: number | null;
+    lowerBand?: number | null;
+    history?: Array<{ value: number; trend: string; upper: number; lower: number; close: number }>;
+  } | null;
+};
+
+export type MultiTimeframeRow = {
+  interval?: string;
+  rsi?: number | null;
+  rsiDir?: "Bull" | "Bear" | "Neutral" | null;
+  supertrendDir?: "Bull" | "Bear" | null;
+  vwapPos?: "Above" | "Below" | null;
+  bias?: string;
+  stValue?: number | null;
+};
+
+export type TradeSetupCard = {
+  id?: string;
+  action?: string;
+  direction?: string;
+  strikeType?: string;
+  tradeLegLabel?: string;
+  confidence?: number;
+  estimatedPremium?: number | null;
+  currentPremium?: number | null;
+  slPremium?: number | null;
+  slUnderlying?: number | null;
+  target1Underlying?: number | null;
+  target2Underlying?: number | null;
+  target1Premium?: number | null;
+  target2Premium?: number | null;
+  riskPerLot?: number | null;
+  rewardPerLot?: number | null;
+  rrRatio?: number | null;
+  lotSize?: number;
+  atrValue?: number | null;
+  supertrendDir?: "up" | "down" | null;
+  supertrendValue?: number | null;
+  thesis?: string[];
+  aiSummary?: string;
+  entryZone?: number[];
+  stopLoss?: number;
+  targets?: number[];
+};
+
+export type OptionChainRow = {
+  strike?: number;
+  ceOi?: number;
+  ceChg?: number;
+  cePremium?: number | null;
+  ceIv?: number | null;
+  ceSymbol?: string;
+  peOi?: number;
+  peChg?: number;
+  pePremium?: number | null;
+  peIv?: number | null;
+  peSymbol?: string;
+  pcr?: number | null;
+  bias?: string;
+};
+
+export type OptionChainPayload = {
+  rows?: OptionChainRow[];
+  totalCeOi?: number;
+  totalPeOi?: number;
+  pcr?: number | null;
+  callVolumePct?: number | null;
+  putVolumePct?: number | null;
+  atmStrike?: number;
+  indexLabel?: string;
+};
+
 export type DashboardState = {
   config: {
     botMode: string;
+    optionLotSize?: number;
+    niftySymbol?: string;
+    marketTimezone?: string;
+    minSignalScore?: number;
+    marketHours?: {
+      openHour?: number;
+      openMinute?: number;
+      closeHour?: number;
+      closeMinute?: number;
+    };
     zerodhaRedirectUrl?: string;
     tradeDiscipline?: string;
+    marketSessionStrict?: boolean;
+    trailingStopUnderlyingPoints?: number;
+    monitorRequireTradeSession?: boolean;
     autoSignals?: {
       enabled?: boolean;
       intervalMinutes?: number;
       /** When positive, scheduler may run between interval ticks when spot moves this % vs last run */
       spotMovePct?: number;
     };
+    /** Max paper BUY entries per IST day (0 = unlimited). */
+    dailyTradeSlotLimit?: number;
+    /** Ledger starts here after a reset; does not change existing `paper-wallet.json` by itself. */
+    paperInitialCapital?: number;
+    paperDefaultLots?: number;
+    paperMaxTradeRupees?: number;
+    paperMaxTradePctWallet?: number;
+    paperCooldownLossCountToday?: number;
+    paperCooldownMaxDailyLossRupees?: number;
+    dashboardBroadcastMsIdle?: number;
+    dashboardBroadcastMsOpen?: number;
+    quoteStaleAfterMs?: number;
+    /** Zerodha product e.g. MIS */
+    orderProduct?: string;
+  };
+  sessionHealth?: {
+    ok?: boolean;
+    mode?: string;
+    message?: string;
+    checkedAt?: string;
+    profile?: {
+      userId?: string;
+      userName?: string;
+      email?: string;
+      broker?: string;
+    } | null;
   };
   runtime: {
     signals?: ArtifactStatus;
@@ -209,6 +403,8 @@ export type DashboardState = {
       pending?: Array<{ id?: string; direction?: string; score?: number }>;
       resolved?: Array<{ id?: string; outcome?: string }>;
     };
+    /** Last successful bulk quote time for open-book marks (ISO) */
+    quoteBulkLastAt?: string | null;
     paperWallet?: {
       initialCapital?: number;
       cashBalance?: number;
@@ -254,6 +450,11 @@ export type DashboardState = {
     autoSignalScheduler?: {
       lastRunAt?: string | null;
       lastSpotAtRun?: number | null;
+      lastError?: {
+        at?: string;
+        message?: string;
+        type?: string;
+      } | null;
       history?: Array<{
         at?: string;
         reason?: string;
@@ -264,6 +465,42 @@ export type DashboardState = {
         option?: string;
         source?: string;
       }>;
+    };
+      tradingDay?: {
+        tradingDate?: string;
+        timezone?: string;
+        dailyTradeSlotLimit?: number;
+        journal?: {
+          tradingDate?: string;
+          entries?: Array<{
+            at?: string;
+            kind?: string;
+            setupId?: string;
+            action?: string;
+            positionId?: string | null;
+            option?: string | null;
+            reason?: string | null;
+          }>;
+        };
+        stats?: {
+          paperBuysToday?: number;
+          openNow?: number;
+          openedTodayCount?: number;
+          closedTodayCount?: number;
+          journalEntryCount?: number;
+          atPaperBuyLimit?: boolean;
+        };
+      };
+      paperAnalytics?: PaperAnalyticsSummary;
+    deskPolicy?: {
+      blocked?: boolean;
+      reasons?: string[];
+      noNewEntries?: { active?: boolean; source?: string | null; updatedAt?: string | null };
+      cooldown?: {
+        blocked?: boolean;
+        reason?: string | null;
+        stats?: { lossCountToday?: number; realizedPnlToday?: number };
+      };
     };
     appliedSuggestion?: {
       appliedAt?: string;
@@ -309,6 +546,16 @@ export type DashboardState = {
   intelligence?: {
     status?: string;
     reason?: string;
+    technicals?: TechnicalsPayload | null;
+    pcr?: number | null;
+    callVolumePct?: number | null;
+    putVolumePct?: number | null;
+    indiaVix?: number | null;
+    maxPain?: number | null;
+    ivAtm?: number | null;
+    multiTimeframe?: MultiTimeframeRow[] | null;
+    tradeSetups?: TradeSetupCard[] | null;
+    optionChain?: OptionChainPayload | null;
     marketMove?: {
       spot?: number;
       previousClose?: number;
@@ -322,6 +569,19 @@ export type DashboardState = {
       openVsPrevCloseGapPct?: number | null;
       regime?: string;
       hint?: string;
+    };
+    strikeLadder?: {
+      atmStrike?: number;
+      indexLabel?: string;
+      rows?: Array<{
+        id?: string;
+        action?: string;
+        strike?: number;
+        premium?: number;
+        tradeLegLabel?: string;
+        moneynessLabel?: string;
+        strikeOffsetSteps?: number;
+      }>;
     };
     atmOptions?: {
       callSymbol?: string | null;
@@ -359,6 +619,8 @@ export type DashboardState = {
     };
     actionableSuggestions?: Array<{
       id: string;
+      tradeLegLabel?: string;
+      strikeOffsetSteps?: number;
       action: string;
       confidence: number;
       status: string;

@@ -289,21 +289,66 @@ export function buildTradeSuggestions({ signal, marketMove, news }) {
   };
 }
 
-function buildPremiumSlice(premiumRaw) {
+/** Premium rupee plan: entry band, SL, T1–T3 (matches typical intraday option card layout). */
+function buildPremiumSlice3T(premiumRaw) {
   const premium = Number(premiumRaw);
   if (!(premium > 0)) {
     return { premiumEntryZone: null, premiumStopLoss: null, premiumTargets: [], premium: null };
   }
-  const premiumRisk = Number(Math.max(premium * 0.18, 6).toFixed(2));
+  const R = Math.max(premium * 0.38, 15);
   return {
-    premium: premium,
-    premiumEntryZone: [Number((premium * 0.99).toFixed(2)), Number((premium * 1.01).toFixed(2))],
-    premiumStopLoss: Number(Math.max(premium - premiumRisk, 0.5).toFixed(2)),
+    premium,
+    premiumEntryZone: [Number((premium * 0.985).toFixed(2)), Number((premium * 1.015).toFixed(2))],
+    premiumStopLoss: Number(Math.max(premium - R, 0.5).toFixed(2)),
     premiumTargets: [
-      Number((premium + premiumRisk * 1.5).toFixed(2)),
-      Number((premium + premiumRisk * 2.2).toFixed(2))
+      Number((premium + R * 0.27).toFixed(2)),
+      Number((premium + R * 0.64).toFixed(2)),
+      Number((premium + R * 1.14).toFixed(2))
     ]
   };
+}
+
+function mergeSuggestionsFromLadder(callSuggestion, putSuggestion, strikeLadder, spot) {
+  const fallbackAtm = Number.isFinite(Number(spot)) ? Math.round(Number(spot) / 50) * 50 : 0;
+  const indexLabel = strikeLadder?.indexLabel ?? "NIFTY";
+  const atmStrike = strikeLadder?.atmStrike ?? fallbackAtm;
+  const rows = strikeLadder?.rows;
+
+  if (!rows?.length) {
+    return [
+      {
+        ...callSuggestion,
+        strikeOffsetSteps: 0,
+        tradeLegLabel: `${indexLabel} ${atmStrike} CE`
+      },
+      {
+        ...putSuggestion,
+        strikeOffsetSteps: 0,
+        tradeLegLabel: `${indexLabel} ${atmStrike} PE`
+      }
+    ];
+  }
+
+  const byAction = { "CALL BUY": callSuggestion, "PUT BUY": putSuggestion };
+  return rows.map((row) => {
+    const base = byAction[row.action];
+    const plan = buildPremiumSlice3T(row.premium);
+    return {
+      ...base,
+      id: row.id,
+      strikeOffsetSteps: row.strikeOffsetSteps,
+      tradeLegLabel: row.tradeLegLabel,
+      status: row.strikeOffsetSteps === 0 ? base.status : "SECONDARY",
+      premiumEntryZone: plan.premiumEntryZone,
+      premiumStopLoss: plan.premiumStopLoss,
+      premiumTargets: plan.premiumTargets,
+      currentPremium: plan.premium,
+      thesis: [
+        `${row.tradeLegLabel} · ${row.moneynessLabel} — LTP ≈ ₹${plan.premium != null ? plan.premium.toFixed(2) : "—"}.`,
+        ...base.thesis.slice(1)
+      ]
+    };
+  });
 }
 
 function mergeChartContext(base, openingContext, legStructure) {
@@ -329,7 +374,8 @@ export function buildActionableSuggestions({
   news,
   suggestions,
   optionPremiums = null,
-  openingContext = null
+  openingContext = null,
+  strikeLadder = null
 }) {
   const spot = marketMove.spot ?? signal.spotPrice ?? signal.indicators?.latestClose ?? signal.entryZone?.[1] ?? 0;
   const fallbackPremium = Number(signal.optionLastPrice ?? 0);
@@ -346,8 +392,8 @@ export function buildActionableSuggestions({
         ? fallbackPremium
         : null;
 
-  const callPremiumPlan = buildPremiumSlice(callPremiumLive);
-  const putPremiumPlan = buildPremiumSlice(putPremiumLive);
+  const callPremiumPlan = buildPremiumSlice3T(callPremiumLive);
+  const putPremiumPlan = buildPremiumSlice3T(putPremiumLive);
 
   const callBiasBoost = suggestions.call.confidence >= suggestions.put.confidence ? 1 : 0;
   const putBiasBoost = suggestions.put.confidence > suggestions.call.confidence ? 1 : 0;
@@ -400,8 +446,7 @@ export function buildActionableSuggestions({
   const callTechScore = signal.dualSide?.call?.score ?? (signal.direction === "CALL" ? signal.score : 0);
   const putTechScore = signal.dualSide?.put?.score ?? (signal.direction === "PUT" ? signal.score : 0);
 
-  return [
-    {
+  const callSuggestion = {
       id: "call-buy",
       action: "CALL BUY",
       confidence: suggestions.call.confidence,
@@ -426,8 +471,8 @@ export function buildActionableSuggestions({
           ? `Spot is ${marketMove.changePct.toFixed(2)}% vs prior close.`
           : "Spot is below prior close — prefer reclaim before aggressive call buys.",
         callPremiumPlan.premium != null
-          ? `ATM CE premium (refreshed) ≈ ${callPremiumPlan.premium}. Stops/targets mapped on this premium.`
-          : "ATM call premium unavailable — run signals with live auth or refresh dashboard."
+          ? `CE premium (ref) ≈ ₹${callPremiumPlan.premium} — SL / T1–T3 on premium row below.`
+          : "Call premium unavailable — run signals with live auth or refresh dashboard."
       ],
       aiSummary:
         news.bias === "bullish" || callTechScore >= putTechScore
@@ -436,8 +481,8 @@ export function buildActionableSuggestions({
       reasoningScore: Number(
         (callTechScore + suggestions.call.confidence + Math.max(0, news.score ?? 0)) / 3
       ).toFixed(1)
-    },
-    {
+    };
+  const putSuggestion = {
       id: "put-buy",
       action: "PUT BUY",
       confidence: suggestions.put.confidence,
@@ -462,8 +507,8 @@ export function buildActionableSuggestions({
           ? `Spot is ${Math.abs(marketMove.changePct).toFixed(2)}% under prior close.`
           : "Spot is above prior close — prefer failed rallies before aggressive put buys.",
         putPremiumPlan.premium != null
-          ? `ATM PE premium (refreshed) ≈ ${putPremiumPlan.premium}. Stops/targets mapped on this premium.`
-          : "ATM put premium unavailable — run signals with live auth or refresh dashboard."
+          ? `PE premium (ref) ≈ ₹${putPremiumPlan.premium} — SL / T1–T3 on premium row below.`
+          : "Put premium unavailable — run signals with live auth or refresh dashboard."
       ],
       aiSummary:
         news.bias === "bearish" || putTechScore > callTechScore
@@ -472,6 +517,7 @@ export function buildActionableSuggestions({
       reasoningScore: Number(
         (putTechScore + suggestions.put.confidence + Math.max(0, -(news.score ?? 0))) / 3
       ).toFixed(1)
-    }
-  ];
+    };
+
+  return mergeSuggestionsFromLadder(callSuggestion, putSuggestion, strikeLadder, spot);
 }

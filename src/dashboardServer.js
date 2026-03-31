@@ -8,23 +8,105 @@ import { WebSocketServer } from "ws";
 import { generateAiAnalysis } from "./aiAnalysis.js";
 import { getConfig, getEnv } from "./config.js";
 import { buildCryptoDashboardPayload, updateCryptoVerification } from "./cryptoStudyEngine.js";
-import { buildPaperWalletSnapshot } from "./paperWallet.js";
-import { exchangeRequestToken, fetchQuote, getLoginUrl } from "./kiteApi.js";
+import { buildPaperWalletSnapshot, resetPaperWalletToConfig } from "./paperWallet.js";
+import { exchangeRequestToken, fetchProfile, fetchQuote, getLoginUrl } from "./kiteApi.js";
 import { loadRuntimeCandles } from "./marketData.js";
 import {
+  checkSessionRun,
   createPaperTradeFromSuggestion,
   exitPaperPositionNow,
-  fetchCallPutAtmPremiums
+  exitPaperPositionPartial,
+  calculateMaxPain,
+  fetchCallPutAtmPremiums,
+  fetchIndiaVix,
+  fetchMultiTimeframeSignals,
+  fetchOptionChainOI,
+  fetchStrikeLadderPremiums
 } from "./executor.js";
+import { buildPaperAnalytics } from "./paperAnalytics.js";
 import { buildActionableSuggestions, buildTradeSuggestions, fetchMarketNews, summarizeNews } from "./newsEngine.js";
 import { buildOpeningContext } from "./sessionContext.js";
 import { isAutoSignalsEnabled, startAutoSignalScheduler } from "./autoSignalScheduler.js";
-import { isMarketOpen, readJson } from "./utils.js";
+import { isTradeSessionOpen } from "./marketCalendar.js";
+import {
+  appendDayJournal,
+  buildTradingDayContext,
+  buildTradingDayExport,
+  countPaperBuysToday,
+  tradingDateKeyIST
+} from "./tradingDayJournal.js";
+import { buildPaperEntryGuard, setDeskNoNewEntriesRuntime } from "./tradingDeskPolicy.js";
+import { persistRunArtifact } from "./reporters.js";
+import { readJson } from "./utils.js";
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, "..");
 const PUBLIC_DIR = path.join(PROJECT_ROOT, "dashboard-dist");
+
+let sessionHealthCache = { at: 0, value: null };
+let sessionHealthTokenKey = "";
+
+// Multi-timeframe cache (refreshes every 5 minutes)
+let multiTfCache = { at: 0, data: null };
+const MULTI_TF_TTL = 5 * 60 * 1000;
+
+// India VIX cache (refreshes every 30 seconds)
+let vixCache = { at: 0, value: null };
+const VIX_TTL = 30 * 1000;
+
+function invalidateSessionHealthCache() {
+  sessionHealthCache = { at: 0, value: null };
+}
+
+async function getSessionHealthSnapshot(config) {
+  const tokenNow = config.zerodha.accessToken || "";
+  if (tokenNow !== sessionHealthTokenKey) {
+    sessionHealthTokenKey = tokenNow;
+    invalidateSessionHealthCache();
+  }
+
+  const ttl = Math.max(5000, Number(config.sessionHealthTtlMs) || 60_000);
+  const now = Date.now();
+  if (!config.zerodha.apiKey || !config.zerodha.accessToken) {
+    return {
+      ok: false,
+      mode: "no_credentials",
+      message: "Zerodha API key or access token missing — connect from the dashboard or update .env.",
+      checkedAt: new Date().toISOString()
+    };
+  }
+  if (now - sessionHealthCache.at < ttl && sessionHealthCache.value) {
+    return sessionHealthCache.value;
+  }
+  try {
+    const profile = await fetchProfile(config);
+    const v = {
+      ok: true,
+      mode: "kite",
+      checkedAt: new Date().toISOString(),
+      profile: profile
+        ? {
+            userId: profile.user_id,
+            userName: profile.user_name,
+            email: profile.email,
+            broker: profile.broker
+          }
+        : null
+    };
+    sessionHealthCache = { at: now, value: v };
+    return v;
+  } catch (error) {
+    const v = {
+      ok: false,
+      mode: "kite",
+      message: error.message ?? "Session check failed",
+      checkedAt: new Date().toISOString()
+    };
+    sessionHealthCache = { at: now, value: v };
+    return v;
+  }
+}
 const PORT = Number(process.env.DASHBOARD_PORT || 3020);
 const HOST = process.env.DASHBOARD_HOST || "127.0.0.1";
 const ALLOWED_COMMANDS = new Set([
@@ -37,7 +119,8 @@ const ALLOWED_COMMANDS = new Set([
   "review-forward",
   "check-session",
   "instruments-refresh",
-  "smoke"
+  "smoke",
+  "smoke-connect"
 ]);
 
 function getDashboardBaseUrl(req) {
@@ -52,29 +135,25 @@ function getDashboardBaseUrl(req) {
 
 function updateEnvValue(key, value) {
   const envPath = path.join(PROJECT_ROOT, ".env");
-  const nextLine = `${key}=${value ?? ""}`;
-  let content = "";
-
-  if (fs.existsSync(envPath)) {
-    content = fs.readFileSync(envPath, "utf8");
-  }
-
-  const lines = content ? content.split("\n") : [];
-  let updated = false;
-  const nextLines = lines.map((line) => {
-    if (line.startsWith(`${key}=`)) {
-      updated = true;
-      return nextLine;
+  const val = value == null ? "" : String(value);
+  const nextLine = `${key}=${val}`;
+  const content = fs.existsSync(envPath) ? fs.readFileSync(envPath, "utf8") : "";
+  const lines = content.length ? content.split("\n") : [];
+  const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const keyRe = new RegExp(`^\\s*${escapedKey}\\s*=`);
+  const kept = lines.filter((line) => {
+    const t = line.trim();
+    if (!t || t.startsWith("#")) {
+      return true;
     }
-    return line;
+    return !keyRe.test(line);
   });
-
-  if (!updated) {
-    nextLines.push(nextLine);
+  kept.push(nextLine);
+  fs.writeFileSync(envPath, kept.join("\n") + "\n", "utf8");
+  process.env[key] = val;
+  if (key === "ZERODHA_ACCESS_TOKEN" || key === "ZERODHA_API_KEY") {
+    invalidateSessionHealthCache();
   }
-
-  fs.writeFileSync(envPath, nextLines.filter(Boolean).join("\n") + "\n", "utf8");
-  process.env[key] = value ?? "";
 }
 
 function redirectWithMessage(res, location) {
@@ -85,6 +164,15 @@ function redirectWithMessage(res, location) {
 function sendJson(res, statusCode, payload) {
   res.writeHead(statusCode, { "Content-Type": "application/json; charset=utf-8" });
   res.end(JSON.stringify(payload, null, 2));
+}
+
+function csvEscape(value) {
+  if (value == null) return "";
+  const t = String(value);
+  if (/[",\n]/.test(t)) {
+    return `"${t.replace(/"/g, '""')}"`;
+  }
+  return t;
 }
 
 function sendFile(res, filePath, contentType) {
@@ -122,7 +210,9 @@ function listRuntimeFiles() {
 function buildDashboardState() {
   const config = getConfig();
   const positions = readJson(getRuntimePath("positions.json"), { open: [], closed: [] });
+  const paperAnalytics = buildPaperAnalytics(positions);
   const tradeState = readJson(getRuntimePath("trade-state.json"), {});
+  const deskPolicy = buildPaperEntryGuard(config, positions);
   return {
     generatedAt: new Date().toISOString(),
     config: {
@@ -134,11 +224,25 @@ function buildDashboardState() {
       marketHours: config.marketHours,
       zerodhaRedirectUrl: config.zerodha.redirectUrl,
       tradeDiscipline: config.tradeDiscipline,
+      marketSessionStrict: config.marketSessionStrict,
+      trailingStopUnderlyingPoints: config.trailingStopUnderlyingPoints,
+      monitorRequireTradeSession: config.monitorRequireTradeSession,
       autoSignals: {
         enabled: isAutoSignalsEnabled(),
         intervalMinutes: Number(getEnv("AUTO_SIGNALS_INTERVAL_MINUTES", "15")) || 15,
         spotMovePct: Number(getEnv("AUTO_SIGNALS_SPOT_MOVE_PCT", "0")) || 0
-      }
+      },
+      dailyTradeSlotLimit: config.dailyTradeSlotLimit,
+      paperInitialCapital: config.paperTrading.initialCapital,
+      paperDefaultLots: config.paperTrading.defaultLots,
+      paperMaxTradeRupees: config.paperMaxTradeRupees,
+      paperMaxTradePctWallet: config.paperMaxTradePctWallet,
+      paperCooldownLossCountToday: config.paperCooldownLossCountToday,
+      paperCooldownMaxDailyLossRupees: config.paperCooldownMaxDailyLossRupees,
+      dashboardBroadcastMsIdle: config.dashboardBroadcastMsIdle,
+      dashboardBroadcastMsOpen: config.dashboardBroadcastMsOpen,
+      quoteStaleAfterMs: config.quoteStaleAfterMs,
+      orderProduct: config.orderDefaults.product
     },
     runtime: {
       files: listRuntimeFiles(),
@@ -150,7 +254,10 @@ function buildDashboardState() {
       backtest: getArtifact("backtest-latest.json"),
       validationSummary: getArtifact("validation-summary.json"),
       forwardReview: getArtifact("review-forward-latest.json"),
-      forwardTracker: getArtifact("forward-tracker.json"),
+      forwardTracker: getArtifact("forward-tracker.json") ?? {
+        pending: [],
+        resolved: []
+      },
       paperWallet: getArtifact("paper-wallet.json"),
       session: getArtifact("check-session-latest.json"),
       appliedSuggestion: getArtifact("applied-suggestion.json"),
@@ -160,7 +267,10 @@ function buildDashboardState() {
       autoSignalScheduler: readJson(
         path.join(config.runtimeDir, "auto-signals-scheduler-state.json"),
         { lastRunAt: null, lastSpotAtRun: null, history: [] }
-      )
+      ),
+      tradingDay: buildTradingDayContext(config, positions),
+      paperAnalytics,
+      deskPolicy
     }
   };
 }
@@ -172,7 +282,8 @@ async function buildPaperTradingPayload(baseState) {
   if (!openPositions.length) {
     return {
       wallet: buildPaperWalletSnapshot(config, openPositions),
-      openPositions
+      openPositions,
+      quoteBulkLastAt: null
     };
   }
 
@@ -180,7 +291,8 @@ async function buildPaperTradingPayload(baseState) {
   if (!canUseBroker) {
     return {
       wallet: buildPaperWalletSnapshot(config, openPositions),
-      openPositions
+      openPositions,
+      quoteBulkLastAt: null
     };
   }
 
@@ -192,25 +304,30 @@ async function buildPaperTradingPayload(baseState) {
         .map((position) => `${position.option.exchange}:${position.option.tradingsymbol}`)
     ];
     const quoteMap = await fetchQuote(config, quoteKeys);
+    const fetchedAt = new Date().toISOString();
+    const idxKey = `${config.niftyIndex.exchange}:${config.niftyIndex.tradingsymbol}`;
     const enrichedPositions = openPositions.map((position) => {
       const optionKey = position.option?.tradingsymbol
         ? `${position.option.exchange}:${position.option.tradingsymbol}`
         : null;
       return {
         ...position,
-        lastObservedSpot: quoteMap[`${config.niftyIndex.exchange}:${config.niftyIndex.tradingsymbol}`]?.last_price ?? position.lastObservedSpot,
-        lastObservedOptionPrice: optionKey ? quoteMap[optionKey]?.last_price ?? position.lastObservedOptionPrice : position.lastObservedOptionPrice
+        lastObservedSpot: quoteMap[idxKey]?.last_price ?? position.lastObservedSpot,
+        lastObservedOptionPrice: optionKey ? quoteMap[optionKey]?.last_price ?? position.lastObservedOptionPrice : position.lastObservedOptionPrice,
+        lastQuoteAt: fetchedAt
       };
     });
 
     return {
       wallet: buildPaperWalletSnapshot(config, enrichedPositions),
-      openPositions: enrichedPositions
+      openPositions: enrichedPositions,
+      quoteBulkLastAt: fetchedAt
     };
   } catch {
     return {
       wallet: buildPaperWalletSnapshot(config, openPositions),
-      openPositions
+      openPositions,
+      quoteBulkLastAt: null
     };
   }
 }
@@ -245,27 +362,31 @@ async function buildChartPayload() {
       value: candle.close
     })),
     pnlHistory,
-    marketOpenNow: isMarketOpen(new Date().toISOString(), config)
+    marketOpenNow: isTradeSessionOpen(new Date().toISOString(), config)
   };
 }
 
 async function buildDashboardPayload() {
-  const [base, intelligence, charts] = await Promise.all([
+  const config = getConfig();
+  const [base, intelligence, charts, sessionHealth] = await Promise.all([
     Promise.resolve(buildDashboardState()),
     buildTradeIntelligence(),
-    buildChartPayload()
+    buildChartPayload(),
+    getSessionHealthSnapshot(config)
   ]);
   const paperTrading = await buildPaperTradingPayload(base);
 
   return {
     ...base,
+    sessionHealth,
     runtime: {
       ...base.runtime,
       positions: {
         ...base.runtime.positions,
         open: paperTrading.openPositions
       },
-      paperWallet: paperTrading.wallet
+      paperWallet: paperTrading.wallet,
+      quoteBulkLastAt: paperTrading.quoteBulkLastAt ?? null
     },
     intelligence,
     charts
@@ -336,6 +457,28 @@ async function buildTradeIntelligence() {
     };
   }
 
+  let strikeLadder = { atmStrike: 0, indexLabel: "NIFTY", rows: [] };
+  try {
+    strikeLadder = await fetchStrikeLadderPremiums(
+      config,
+      marketMove.spot,
+      signal.timestamp || new Date().toISOString()
+    );
+  } catch {
+    strikeLadder = { atmStrike: 0, indexLabel: "NIFTY", rows: [] };
+  }
+
+  let optionChain = { rows: [], totalCeOi: 0, totalPeOi: 0, pcr: null, callVolumePct: null, putVolumePct: null, atmStrike: strikeLadder.atmStrike, indexLabel: strikeLadder.indexLabel };
+  try {
+    optionChain = await fetchOptionChainOI(
+      config,
+      marketMove.spot,
+      signal.timestamp || new Date().toISOString()
+    );
+  } catch {
+    /* leave empty */
+  }
+
   let headlines = [];
   let newsSummary = { bullish: 0, bearish: 0, neutral: 0, score: 0, bias: "neutral" };
   let newsError = null;
@@ -358,7 +501,76 @@ async function buildTradeIntelligence() {
     news: newsSummary,
     suggestions,
     optionPremiums: { call: optionPremiums.call, put: optionPremiums.put },
-    openingContext
+    openingContext,
+    strikeLadder
+  });
+
+  // India VIX (cached 30s)
+  let indiaVix = null;
+  if (Date.now() - vixCache.at < VIX_TTL && vixCache.value !== null) {
+    indiaVix = vixCache.value;
+  } else {
+    try {
+      indiaVix = await fetchIndiaVix(config);
+      vixCache = { at: Date.now(), value: indiaVix };
+    } catch { /* leave null */ }
+  }
+
+  // Multi-timeframe analysis (cached 5min)
+  let multiTimeframe = null;
+  const instrument = config.niftyIndex;
+  if (instrument?.instrumentToken) {
+    if (Date.now() - multiTfCache.at < MULTI_TF_TTL && multiTfCache.data) {
+      multiTimeframe = multiTfCache.data;
+    } else {
+      try {
+        multiTimeframe = await fetchMultiTimeframeSignals(config, instrument);
+        multiTfCache = { at: Date.now(), data: multiTimeframe };
+      } catch { /* leave null */ }
+    }
+  }
+
+  // Max pain from option chain OI
+  const maxPain = calculateMaxPain(optionChain?.rows ?? []);
+
+  // ATM IV from chain
+  const atmRow = optionChain?.rows?.find((r) => r.strike === optionChain.atmStrike);
+  const ivAtm = atmRow?.ceIv ?? atmRow?.peIv ?? null;
+
+  // Build trade setup cards for actionable suggestions
+  const atr = signal.technicals?.atr?.value ?? null;
+  const supertrend = signal.technicals?.supertrend ?? null;
+  const spot = marketMove.spot ?? null;
+  const lotSize = config.optionSelection?.lotSize ?? 50;
+  const tradeSetups = (actionableSuggestions || []).map((sug) => {
+    const premium = sug.estimatedPremium ?? sug.premium ?? null;
+    const isBull = sug.direction === "CALL";
+    const slUnderlying = atr && spot ? (isBull ? spot - 1.5 * atr : spot + 1.5 * atr) : null;
+    const t1Underlying = atr && spot ? (isBull ? spot + 2 * atr : spot - 2 * atr) : null;
+    const t2Underlying = atr && spot ? (isBull ? spot + 3 * atr : spot - 3 * atr) : null;
+    const slPremium = premium != null ? Number((premium * 0.5).toFixed(1)) : null;
+    const deltaApprox = sug.strikeType === "ATM" ? 0.45 : sug.strikeType === "OTM1" ? 0.28 : 0.18;
+    const t1Premium = premium != null && atr ? Number((premium + deltaApprox * 2 * atr).toFixed(1)) : null;
+    const t2Premium = premium != null && atr ? Number((premium + deltaApprox * 3 * atr).toFixed(1)) : null;
+    const riskPer = premium != null && slPremium != null ? Number(((premium - slPremium) * lotSize).toFixed(0)) : null;
+    const rewardPer = t1Premium != null && premium != null ? Number(((t1Premium - premium) * lotSize).toFixed(0)) : null;
+    const rrRatio = riskPer && rewardPer ? Number((rewardPer / riskPer).toFixed(1)) : null;
+    return {
+      ...sug,
+      atrValue: atr,
+      slPremium,
+      slUnderlying: slUnderlying != null ? Number(slUnderlying.toFixed(0)) : null,
+      target1Underlying: t1Underlying != null ? Number(t1Underlying.toFixed(0)) : null,
+      target2Underlying: t2Underlying != null ? Number(t2Underlying.toFixed(0)) : null,
+      target1Premium: t1Premium,
+      target2Premium: t2Premium,
+      riskPerLot: riskPer,
+      rewardPerLot: rewardPer,
+      rrRatio,
+      lotSize,
+      supertrendDir: supertrend?.trend ?? null,
+      supertrendValue: supertrend?.value ?? null
+    };
   });
 
   return {
@@ -366,6 +578,8 @@ async function buildTradeIntelligence() {
     generatedAt: new Date().toISOString(),
     marketMove,
     openingContext,
+    strikeLadder,
+    optionChain,
     atmOptions: {
       callSymbol: optionPremiums.callOption?.tradingsymbol ?? null,
       putSymbol: optionPremiums.putOption?.tradingsymbol ?? null,
@@ -373,6 +587,15 @@ async function buildTradeIntelligence() {
       putPremium: optionPremiums.put,
       fetchError: optionPremiums.fetchError ?? null
     },
+    technicals: signal.technicals ?? null,
+    pcr: optionChain.pcr,
+    callVolumePct: optionChain.callVolumePct,
+    putVolumePct: optionChain.putVolumePct,
+    indiaVix,
+    maxPain,
+    ivAtm,
+    multiTimeframe,
+    tradeSetups,
     news: {
       summary: newsSummary,
       headlines,
@@ -462,6 +685,55 @@ function routeApi(req, res, url) {
     return true;
   }
 
+  if (req.method === "GET" && url.pathname === "/api/export/trading-day") {
+    try {
+      const config = getConfig();
+      const store = readJson(getRuntimePath("positions.json"), { open: [], closed: [] });
+      const payload = buildTradingDayExport(config, store);
+      const format = (url.searchParams.get("format") || "json").toLowerCase();
+      if (format === "csv") {
+        const lines = ["section,kind,at,setupId,action,positionId,option,reason,extra"];
+        for (const e of payload.journal?.entries ?? []) {
+          lines.push(
+            [
+              "journal",
+              csvEscape(e.kind),
+              csvEscape(e.at),
+              csvEscape(e.setupId),
+              csvEscape(e.action),
+              csvEscape(e.positionId),
+              csvEscape(e.option),
+              csvEscape(e.reason),
+              ""
+            ].join(",")
+          );
+        }
+        for (const c of payload.closedTradesToday ?? []) {
+          lines.push(
+            [
+              "closed",
+              csvEscape(c.status),
+              csvEscape(c.closedAt),
+              csvEscape(c.paperSetupId),
+              csvEscape(c.direction),
+              csvEscape(c.id),
+              csvEscape(c.option?.tradingsymbol ?? c.symbol),
+              csvEscape(c.exit?.reason),
+              csvEscape(c.quantity)
+            ].join(",")
+          );
+        }
+        res.writeHead(200, { "Content-Type": "text/csv; charset=utf-8" });
+        res.end(lines.join("\n"));
+        return true;
+      }
+      sendJson(res, 200, payload);
+    } catch (error) {
+      sendJson(res, 500, { error: error.message });
+    }
+    return true;
+  }
+
   if (req.method === "GET" && url.pathname === "/api/crypto-dashboard") {
     buildCryptoDashboardPayload(getConfig())
       .then((payload) => sendJson(res, 200, payload))
@@ -495,6 +767,11 @@ function routeApi(req, res, url) {
           newsBias: intelligence.news?.summary?.bias ?? "neutral"
         };
         writeArtifact("applied-suggestion.json", payload);
+        appendDayJournal(getConfig(), {
+          kind: "APPLY_PLAN",
+          setupId: selected.id,
+          action: selected.action
+        });
         sendJson(res, 200, {
           ok: true,
           applied: payload,
@@ -516,7 +793,24 @@ function routeApi(req, res, url) {
           return;
         }
 
-        const result = await createPaperTradeFromSuggestion(getConfig(), selected, intelligence);
+        const config = getConfig();
+        if (
+          config.dailyTradeSlotLimit > 0 &&
+          countPaperBuysToday(config) >= config.dailyTradeSlotLimit
+        ) {
+          sendJson(res, 400, {
+            error: `Daily paper trade limit (${config.dailyTradeSlotLimit}) reached for ${tradingDateKeyIST(config)}. Exit or wait for next session.`
+          });
+          return;
+        }
+
+        const result = await createPaperTradeFromSuggestion(config, selected, intelligence);
+        appendDayJournal(config, {
+          kind: "PAPER_BUY",
+          setupId: selected.id,
+          action: selected.action,
+          positionId: result.position?.id ?? null
+        });
         sendJson(res, 200, {
           ok: true,
           result,
@@ -524,6 +818,26 @@ function routeApi(req, res, url) {
         });
       })
       .catch((error) => sendJson(res, 400, { error: error.message }));
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/reset-paper-wallet") {
+    try {
+      const config = getConfig();
+      const store = readJson(getRuntimePath("positions.json"), { open: [], closed: [] });
+      if ((store.open?.length ?? 0) > 0) {
+        sendJson(res, 400, {
+          error: "Close all open positions before resetting the paper wallet (ledger must match no open risk)."
+        });
+        return true;
+      }
+      resetPaperWalletToConfig(config);
+      buildDashboardPayload()
+        .then((dashboardState) => sendJson(res, 200, { ok: true, dashboardState }))
+        .catch((error) => sendJson(res, 500, { error: error.message }));
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
     return true;
   }
 
@@ -535,10 +849,56 @@ function routeApi(req, res, url) {
           return;
         }
 
-        const result = await exitPaperPositionNow(getConfig(), body.positionId);
+        const config = getConfig();
+        const result = await exitPaperPositionNow(config, body.positionId);
+        appendDayJournal(config, {
+          kind: "PAPER_EXIT",
+          positionId: body.positionId,
+          option: result.closedPosition?.option?.tradingsymbol ?? null,
+          reason: result.closedPosition?.exit?.reason ?? null
+        });
         sendJson(res, 200, {
           ok: true,
           result,
+          dashboardState: await buildDashboardPayload()
+        });
+      })
+      .catch((error) => sendJson(res, 400, { error: error.message }));
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/paper-exit-partial") {
+    readRequestBody(req)
+      .then(async (body) => {
+        if (!body.positionId) {
+          sendJson(res, 400, { error: "positionId is required." });
+          return;
+        }
+        const pct = Number(body.pct ?? body.fractionPct);
+        const config = getConfig();
+        const result = await exitPaperPositionPartial(config, body.positionId, pct);
+        sendJson(res, 200, {
+          ok: true,
+          result,
+          dashboardState: await buildDashboardPayload()
+        });
+      })
+      .catch((error) => sendJson(res, 400, { error: error.message }));
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/desk-no-new-entries") {
+    readRequestBody(req)
+      .then(async (body) => {
+        if (typeof body.enabled !== "boolean") {
+          sendJson(res, 400, { error: "Body must include enabled: true|false." });
+          return;
+        }
+        const config = getConfig();
+        const meta = setDeskNoNewEntriesRuntime(config, body.enabled);
+        sendJson(res, 200, {
+          ok: true,
+          deskNoNewEntries: meta,
           dashboardState: await buildDashboardPayload()
         });
       })
@@ -612,6 +972,41 @@ function routeApi(req, res, url) {
     return true;
   }
 
+  if (req.method === "POST" && url.pathname === "/api/set-access-token") {
+    readRequestBody(req)
+      .then(async (body) => {
+        const token = typeof body.accessToken === "string" ? body.accessToken.trim() : "";
+        if (token.length < 8) {
+          sendJson(res, 400, { error: "Access token is too short or missing." });
+          return;
+        }
+        updateEnvValue("ZERODHA_ACCESS_TOKEN", token);
+
+        const freshConfig = getConfig();
+        let sessionResult = null;
+        let sessionOk = false;
+        try {
+          sessionResult = await checkSessionRun(freshConfig);
+          persistRunArtifact(freshConfig, "check-session", sessionResult);
+          sessionOk = sessionResult?.status === "SESSION_OK" || sessionResult?.status === "ok" || sessionResult?.status === "verified";
+        } catch (sessionErr) {
+          sessionResult = { status: "error", message: sessionErr.message };
+        }
+
+        broadcastDashboardSnapshot();
+
+        sendJson(res, 200, {
+          ok: sessionOk,
+          session: sessionResult,
+          message: sessionOk
+            ? "Token saved and session verified."
+            : `Token saved but session check failed: ${sessionResult?.message || "unknown error"}`
+        });
+      })
+      .catch((error) => sendJson(res, 400, { error: error.message }));
+    return true;
+  }
+
   return false;
 }
 
@@ -656,7 +1051,7 @@ const server = createServer((req, res) => {
     }
 
     exchangeRequestToken(config, requestToken)
-      .then((result) => {
+      .then(async (result) => {
         const accessToken = result?.data?.access_token || result?.access_token;
         const userId = result?.data?.user_id || result?.user_id;
         if (!accessToken) {
@@ -667,6 +1062,16 @@ const server = createServer((req, res) => {
         if (userId) {
           updateEnvValue("ZERODHA_USER_ID", userId);
         }
+
+        try {
+          const freshConfig = getConfig();
+          const sessionResult = await checkSessionRun(freshConfig);
+          persistRunArtifact(freshConfig, "check-session", sessionResult);
+        } catch {
+          /* token saved; CLI will still validate */
+        }
+
+        broadcastDashboardSnapshot();
 
         nextUrl.searchParams.set("zerodha", "connected");
         redirectWithMessage(res, nextUrl.toString());
@@ -754,9 +1159,32 @@ wss.on("connection", async (socket) => {
   }
 });
 
-setInterval(() => {
-  void broadcastDashboardSnapshot();
-}, 15000);
+function scheduleDashboardBroadcast() {
+  const config = getConfig();
+  const t = setTimeout(async () => {
+    await broadcastDashboardSnapshot();
+    scheduleDashboardBroadcast();
+  }, nextBroadcastDelayMs(config));
+
+  if (typeof t.unref === "function") {
+    t.unref();
+  }
+}
+
+function nextBroadcastDelayMs(config) {
+  let store;
+  try {
+    store = readJson(getRuntimePath("positions.json"), { open: [], closed: [] });
+  } catch {
+    store = { open: [] };
+  }
+  const hasOpen = (store.open?.length ?? 0) > 0;
+  const fast = Math.max(2000, Number(config.dashboardBroadcastMsOpen) || 5000);
+  const slow = Math.max(3000, Number(config.dashboardBroadcastMsIdle) || 15_000);
+  return hasOpen ? fast : slow;
+}
+
+scheduleDashboardBroadcast();
 
 server.listen(PORT, HOST, () => {
   console.log(`Dashboard running at http://${HOST}:${PORT}`);

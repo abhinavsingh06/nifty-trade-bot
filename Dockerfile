@@ -15,6 +15,7 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 COPY --from=build /app/dashboard-dist ./dashboard-dist
 COPY src ./src
+COPY data ./data
 RUN mkdir -p runtime
 EXPOSE 3020
 CMD ["node", "src/dashboardServer.js"]

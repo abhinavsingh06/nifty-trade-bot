@@ -42,15 +42,20 @@ It uses sample NIFTY candle data by default, and it can switch to live Zerodha K
 - paper-trade-first mode switch so live auth does not immediately place orders unless `BOT_MODE=live`
 - persistent open-position tracking with monitor-driven stop-loss and target handling
 - option-premium-aware monitor exits when option quotes are available
-- broker-side reconciliation against Zerodha order and position endpoints
+- broker-side reconciliation against Zerodha order, **trade (fill)**, and position endpoints
+- optional **NSE holiday calendar** with `MARKET_SESSION_STRICT` for session-aware automation
+- **Trailing stops** (underlying + option premium) after target 1; monitor **exit polling** and strict **wait-for-fill** mode
+- **Option-premium-based** realized PnL in daily `trade-state` when exit fills are known
 - persisted runtime artifacts for automation use
 
-## What you still need for live trading
+## Session rules, monitoring, and reconciliation
 
-- position monitoring, trailing stop logic, and PnL reconciliation
-- holiday calendar and strict market-hours blocking
-- exit-order orchestration for stop loss and targets
-- position reconciliation against broker-side fills
+- **Holidays + strict session:** set `MARKET_SESSION_STRICT=1` to block signals, live candles, auto-signals, and risk checks on dates listed in `data/nse-holidays.json` (override path with `NSE_HOLIDAY_CALENDAR_PATH`). Sync that file yearly with the [NSE holiday list](https://www.nseindia.com/resources/exchange-communication-holidays).
+- **Trailing stops:** after target 1 is hit (breakeven arm), set `TRAILING_STOP_UNDERLYING_POINTS` (NIFTY points) and/or `TRAILING_STOP_OPTION_POINTS` (premium rupees) to ratchet stops with peak/trough price.
+- **Exit orchestration (live):** monitor submits exit orders then polls `/orders` for fill (`EXIT_POLL_MAX_MS`, `EXIT_POLL_INTERVAL_MS`). Set `EXIT_WAIT_FOR_FILL=1` to **keep the position open locally** until a fill is confirmed (safer if the order rests on the book).
+- **Monitor outside hours:** default `MONITOR_REQUIRE_TRADE_SESSION=1` skips monitoring when the session is closed; set `0` if you must manage overnight positions from the bot.
+- **PnL:** `recordTradeExit` uses **option entry vs exit premium** when available (`optionFillPrice` or mark `optionPrice`); otherwise it falls back to the underlying proxy.
+- **Reconcile:** `npm run reconcile` loads orders, **today’s trades (fills)**, and net positions; open rows include a same-day trade summary per symbol; `closedFillHints` estimates premium PnL from exit `order_id` vs local entry.
 
 ## Suggested automation prompts
 

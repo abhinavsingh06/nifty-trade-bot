@@ -38,6 +38,7 @@ export function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
 
+/** Weekday + clock window in `config.marketTimezone`. Does not include exchange holidays — use `isTradeSessionOpen` from `marketCalendar.js` when strict. */
 export function isMarketOpen(timestamp, config) {
   const parts = new Intl.DateTimeFormat("en-GB", {
     timeZone: config.marketTimezone,
