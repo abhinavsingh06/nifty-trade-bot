@@ -28,25 +28,18 @@ export async function loadRuntimeCandles(config, options = {}) {
   }
 
   const now = new Date();
-  if (!isTradeSessionOpen(now.toISOString(), config)) {
-    if (allowSampleFallback) {
-      return {
-        candles: loadCandles(),
-        source: "sample",
-        skipped: false,
-        reason: "Market is closed, using sample candles for smoke/demo flow."
-      };
-    }
+  const marketOpen = isTradeSessionOpen(now.toISOString(), config);
 
-    return {
-      candles: [],
-      source: "live",
-      skipped: true,
-      reason: "Market is currently closed. Skipping live candle analysis."
-    };
-  }
+  // Always look back at least 5 calendar days (≈ 3 trading sessions).
+  // RSI needs 14, MACD needs 35, Bollinger Bands need 20 — without prior-day
+  // candles signals fail in the first ~2 hours of each session.
+  // Zerodha only returns candles on actual trading days, so 5 calendar days
+  // reliably covers the last 3 sessions even over long weekends.
+  const intradayMs = config.historicalLookbackMinutes * 60 * 1000;
+  const minLookbackMs = 5 * 24 * 60 * 60 * 1000;
+  const lookbackMs = Math.max(intradayMs, minLookbackMs);
 
-  const from = new Date(now.getTime() - config.historicalLookbackMinutes * 60 * 1000);
+  const from = new Date(now.getTime() - lookbackMs);
   const liveCandles = await fetchHistoricalCandles(
     config,
     config.niftyIndex.instrumentToken,
@@ -56,21 +49,36 @@ export async function loadRuntimeCandles(config, options = {}) {
   );
 
   if (!liveCandles.length) {
-    throw new Error("Zerodha returned no live candles during market hours. Refusing to fall back to sample data.");
+    if (allowSampleFallback) {
+      return {
+        candles: loadCandles(),
+        source: "sample",
+        skipped: false,
+        reason: "Zerodha returned no candles — using sample data."
+      };
+    }
+    throw new Error(
+      marketOpen
+        ? "Zerodha returned no live candles during market hours."
+        : "Zerodha returned no candles for the last 5 days. Check your session token."
+    );
   }
 
+  const mapped = liveCandles.map((candle) => ({
+    timestamp: candle[0],
+    open: candle[1],
+    high: candle[2],
+    low: candle[3],
+    close: candle[4],
+    volume: candle[5]
+  }));
+
+  const statusNote = marketOpen ? "market open" : "market closed — prior session data";
   return {
-    candles: liveCandles.map((candle) => ({
-      timestamp: candle[0],
-      open: candle[1],
-      high: candle[2],
-      low: candle[3],
-      close: candle[4],
-      volume: candle[5]
-    })),
+    candles: mapped,
     source: "live",
     skipped: false,
-    reason: "Loaded live candles from Zerodha."
+    reason: `Loaded ${mapped.length} candles from Zerodha (${statusNote}).`
   };
 }
 
